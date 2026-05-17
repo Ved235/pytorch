@@ -203,6 +203,7 @@ class FakeTensorUpdater:
 
     def __init__(self, gm: torch.fx.GraphModule) -> None:
         self.processed_hashes = OrderedSet[_FxNodeHash]()
+        self.tracked_node_ids: OrderedSet[int] = OrderedSet()
         self.gm = gm
 
         # Import here to avoid circular import issues.
@@ -215,6 +216,7 @@ class FakeTensorUpdater:
 
         for node in self.gm.graph.nodes:
             self.processed_hashes.add(self.hash_node(node))
+            self.tracked_node_ids.add(id(node))
 
     def hash_node(self, node: torch.fx.Node) -> _FxNodeHash:
         def get_hash_or_ids(n_iter: Iterable[Any]) -> tuple[int, ...]:
@@ -297,7 +299,11 @@ class FakeTensorUpdater:
                 # with no implemented __eq__ method will compare IDs.
                 return new == old
 
-            if new.layout != old.layout or not is_intlist_same(new.shape, old.shape):
+            if (
+                new.layout != old.layout
+                or new.dtype != old.dtype
+                or not is_intlist_same(new.shape, old.shape)
+            ):
                 return False
 
             if new.device != old.device:
@@ -418,7 +424,38 @@ class FakeTensorUpdater:
         # Value records whether subgraph outputs have been updated.
         subgraph_updatings: dict[torch.fx.GraphModule, bool] = {}
         for node in self.gm.graph.nodes:
-            current_graph_hashes.add(hash := self.hash_node(node))
+            current_graph_hashes.add(node_hash := self.hash_node(node))
+
+            # Lowering functions consume Inductor IR nodes, not FakeTensors, so
+            # FakeTensorUpdater cannot safely recompute their metadata.
+            if hasattr(node.target, "_inductor_lowering_function") and (
+                node_hash not in self.processed_hashes or id(node) in to_process
+            ):
+                if id(node) in to_process:
+                    raise RuntimeError(
+                        "FakeTensorUpdater cannot recompute metadata for "
+                        "_inductor_lowering_function nodes after their dependencies "
+                        "change because those targets expect Inductor IR inputs rather "
+                        "than FakeTensor inputs. "
+                        f"Encountered node with changed dependency: {node.format_node()}"
+                    )
+                if id(node) in self.tracked_node_ids:
+                    raise RuntimeError(
+                        "FakeTensorUpdater cannot recompute metadata for tracked "
+                        "_inductor_lowering_function nodes after their inputs or "
+                        "dependencies change because those targets expect "
+                        "Inductor IR inputs rather than FakeTensor inputs. "
+                        f"Encountered changed node: {node.format_node()}"
+                    )
+                if "val" not in node.meta:
+                    raise RuntimeError(
+                        "FakeTensorUpdater requires newly inserted "
+                        "_inductor_lowering_function nodes to already carry fake "
+                        "metadata in node.meta['val']. "
+                        f"Encountered new node without metadata: {node.format_node()}"
+                    )
+                continue
+
             is_valid, args, kwargs = get_fake_args_kwargs(node, self.gm)
             if not is_valid:
                 continue
@@ -430,7 +467,7 @@ class FakeTensorUpdater:
             if (
                 # Always run updates on nodes that invoke subgraphs
                 not (invokes_subgraph := node_invokes_subgraph(node, *args, **kwargs))
-                and hash in self.processed_hashes
+                and node_hash in self.processed_hashes
                 and id(node) not in to_process
             ):
                 continue
@@ -518,6 +555,13 @@ class FakeTensorUpdater:
             ):
                 continue
 
+            storage_only_change = "val" in node.meta and is_fake_tensor_same(
+                new_fake_tensor,
+                node.meta["val"],
+                check_storage=False,
+                node=node,
+            )
+
             rebind_unbacked(V.fake_mode.shape_env, node, new_fake_tensor)
 
             node.meta["val"] = new_fake_tensor
@@ -532,9 +576,21 @@ class FakeTensorUpdater:
 
             existing_storages[get_node_storage(node)] += 1
 
-            to_process.update(id(user) for user in node.users)
+            to_process.update(
+                id(user)
+                for user in node.users
+                if not (
+                    storage_only_change
+                    and getattr(
+                        user.target,
+                        "_inductor_lowering_output_metadata_ignores_input_storage",
+                        False,
+                    )
+                )
+            )
 
         self.processed_hashes = current_graph_hashes
+        self.tracked_node_ids = OrderedSet([id(node) for node in self.gm.graph.nodes])
 
         return nodes_updated
 
